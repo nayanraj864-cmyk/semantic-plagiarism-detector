@@ -49,14 +49,63 @@ class ClientIPLoggingMiddleware(BaseHTTPMiddleware):
 
 
 class SecurityHeadersMiddleware(BaseHTTPMiddleware):
-    """Add anti-clickjacking and security headers to every HTTP response."""
+    """Add strict security headers to every HTTP response.
 
-    async def dispatch(self, request, call_next):
+    Headers applied
+    ---------------
+    Content-Security-Policy
+        Strict policy built by :func:`src.security.csp.build_csp_header`.
+        Blocks inline scripts, ``eval()``, and disallows framing.
+        Domain allow-lists are configurable via environment variables
+        (see :mod:`src.security.csp` for documentation).
+    X-Frame-Options
+        Legacy clickjacking protection; ``frame-ancestors 'none'`` in CSP
+        is the modern equivalent, but we emit both for older browser support.
+    X-Content-Type-Options
+        Instructs browsers not to MIME-sniff responses, preventing content
+        injection via responses served with a permissive or wrong MIME type.
+    X-XSS-Protection
+        Instructs legacy browsers (IE/Edge ≤ 18) to enable their built-in
+        reflected-XSS filter.  Modern browsers ignore this header in favour
+        of CSP, but it adds no harm.
+    Referrer-Policy
+        Sends only the origin (not the full URL) for cross-origin navigations,
+        protecting URL-embedded tokens and query parameters from leaking.
+    Permissions-Policy
+        Opts out of browser features that are not required by the application
+        (camera, microphone, geolocation, payment, USB).
+    Strict-Transport-Security (optional)
+        Enabled when the ``ENABLE_HSTS`` environment variable is set to a
+        truthy value.  Should only be activated once TLS is confirmed to be
+        stable for the deployment.
+    """
+
+    async def dispatch(self, request: Request, call_next) -> Response:
+        from src.security.csp import build_csp_header
+
         response = await call_next(request)
+
+        # ── Strict Content Security Policy (Issue #1561) ──────────────────
+        response.headers["Content-Security-Policy"] = build_csp_header()
+
+        # ── Clickjacking (legacy + modern) ───────────────────────────────
         response.headers["X-Frame-Options"] = "DENY"
-        response.headers["Content-Security-Policy"] = (
-            "frame-ancestors 'none'; default-src 'self';"
+
+        # ── MIME-sniffing prevention ──────────────────────────────────────
+        response.headers["X-Content-Type-Options"] = "nosniff"
+
+        # ── Legacy XSS filter (IE / old Edge) ────────────────────────────
+        response.headers["X-XSS-Protection"] = "1; mode=block"
+
+        # ── Referrer leakage prevention ──────────────────────────────────
+        response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+
+        # ── Feature / Permissions policy ─────────────────────────────────
+        response.headers["Permissions-Policy"] = (
+            "camera=(), microphone=(), geolocation=(), payment=(), usb=()"
         )
+
+        # ── HSTS (opt-in via env var) ─────────────────────────────────────
         enable_hsts = os.getenv("ENABLE_HSTS", "").strip().lower() in (
             "true",
             "1",
@@ -65,9 +114,10 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
         )
         if enable_hsts:
             response.headers["Strict-Transport-Security"] = (
-                "max-age=31536000; includeSubDomains"
+                "max-age=31536000; includeSubDomains; preload"
             )
         return response
+
 
 
 class ContentLengthLimitMiddleware(BaseHTTPMiddleware):
